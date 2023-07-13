@@ -332,7 +332,7 @@ class QuizBot:
 
         await context.bot.send_message(
             chat_id=chat_id,
-            text='Жду ФИО'
+            text='Укажите, пожалуйста, Ваше ФИО'
         )
     
     async def _show_quizzes_to_pass(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
