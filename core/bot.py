@@ -1,34 +1,45 @@
-import re, uuid
+import re
+from io import BytesIO
 from openpyxl import Workbook
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ApplicationBuilder,\
                          ContextTypes, CommandHandler,\
                          CallbackQueryHandler, MessageHandler,\
                          filters
-from core.bot_session import BotSession
-from core.utils import ADMIN_KEYBOARD, USER_KEYBOARD, QUIZZES_MENU_KEYBOARD
-from core.filters import StartFilter, RealNameFilter, QuizCreationFilter
-from core.quiz import QuizBuilder, QuizCreationError
+from telegram.error import BadRequest
+from core.base_api import API
+from core.utils import ADMIN_START_MENU_KEYBOARD, USER_START_MENU_KEYBOARD,\
+                       QUIZZES_MENU_KEYBOARD, ADMIN_PANEL_KEYBOARD
+from core.filters import StartFilter, RealNameFilter, QuizCreationFilter, AdminFilter
+from core.quiz_builder import QuizBuilder, QuizCreationError
+from core.logger import Logger
+
 
 class QuizBot:
-    def __init__(self, token, admins) -> None:
+    __slots__ = ('_api', '_app')
+
+    def __init__(self,
+                 token, api: API,
+                 admin_key: str) -> None:
         self._app = ApplicationBuilder().token(token).build()
-        self._session = BotSession()
-        self._admins = admins
-        self._add_handlers()
+        self._api = api
+        self._add_handlers(admin_key)
     
-    def _add_handlers(self) -> None:
-        start_filter = StartFilter(self._session)
-        real_name_filter = RealNameFilter(self._session)
-        quiz_creation_filter = QuizCreationFilter(self._session, self._admins)
+    def _add_handlers(self, admin_key: str) -> None:
+        start_filter = StartFilter(self._api)
+        real_name_filter = RealNameFilter(self._api)
+        admin_filter = AdminFilter(self._api)
+        quiz_creation_filter = QuizCreationFilter(self._api)
 
         self._app.add_handlers([
-            CommandHandler('start', self._start_user_session, start_filter),
+            CommandHandler(admin_key, self._make_user_admin),
+            CommandHandler('menu', self._start_menu),
+            CommandHandler('start', self._authorize_user, start_filter),
             MessageHandler(filters.TEXT & real_name_filter, self._set_user_real_name),
-            MessageHandler(filters.TEXT & quiz_creation_filter, self._create_quiz),
+            MessageHandler(admin_filter & filters.TEXT & quiz_creation_filter, self._create_quiz),
             CallbackQueryHandler(self._create_quiz, pattern='cancel'),
             CallbackQueryHandler(self._show_quizzes_to_pass, pattern='choose_quiz'),
-            CallbackQueryHandler(self._toggle_quiz_status, pattern='toggle:*'),
+            CallbackQueryHandler(self._toggle_quiz_activity, pattern='toggle:*'),
             CallbackQueryHandler(self._delete_confirmation, pattern='request_deletion:*'),
             CallbackQueryHandler(self._delete_quiz, pattern='delete:*'),
             CallbackQueryHandler(self._init_user_quiz, pattern='choose:*'),
@@ -36,17 +47,113 @@ class QuizBot:
             CallbackQueryHandler(self._download_quiz_results, pattern='download:*'),
             CallbackQueryHandler(self._get_quiz_results, pattern='results:*'),
             CallbackQueryHandler(self._submit_quiz_answer, pattern='quize:*'),
-            CallbackQueryHandler(self._edit_user_real_name, pattern='edit_real_name'),
+            CallbackQueryHandler(self._change_user_real_name, pattern='edit_real_name'),
             CallbackQueryHandler(self._quizzes_menu, pattern='quizzes_menu'),
             CallbackQueryHandler(self._init_quiz_creation, pattern='create_quiz'),
             CallbackQueryHandler(self._return, pattern='return:*'),
-            CallbackQueryHandler(self._show_quizzes_to_manage, pattern='show_quizzes_to_manage')
+            CallbackQueryHandler(self._show_quizzes_to_manage, pattern='show_quizzes_to_manage'),
+            CallbackQueryHandler(self._show_admin_panel, pattern='admin_panel'),
+            CallbackQueryHandler(self._show_users_list, pattern='users_list'),
+            CallbackQueryHandler(self._show_logs, pattern='logs:*'),
+            CallbackQueryHandler(self._clear_logs, pattern='clear_logs:*')
         ])
 
-    async def _init_quiz_creation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _show_users_list(self,
+                               update: Update,
+                               context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         message_id = update.effective_message.id
-        self._session.init_quiz_creation(chat_id)
+        users = self._api.get_all_users()
+
+        message = '\n'.join(f'[{x[0]}]({x[1]}) - {x[2]}{" (admin)" if x[3] else ""}'\
+                             for x in users)
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton('🔄 Обновить', callback_data='users_list')],
+                [InlineKeyboardButton('↩️ Назад', callback_data='return:admin_panel')],
+                [InlineKeyboardButton('🏠 Домой', callback_data='return:menu')]
+            ]
+        )
+
+        try:
+            await context.bot.edit_message_text(
+                text=message,
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=keyboard,
+                parse_mode='Markdown'
+            )
+        except BadRequest:
+            pass
+
+    async def _clear_logs(self,
+                         update: Update,
+                         context: ContextTypes.DEFAULT_TYPE):
+        log_type = update.callback_query.data.split(':')[1]
+
+        Logger.clear_logs(log_type)
+
+        await self._show_logs(update, context)
+
+    async def _show_logs(self,
+                         update: Update,
+                         context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        message_id = update.effective_message.id
+        log_type = update.callback_query.data.split(':')[1]
+
+        with open(f'logs/{log_type}_logs.txt', 'r') as f:
+            message = '\n'.join(f.readlines())
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton('🔄 Обновить', callback_data=f'logs:{log_type}')],
+                [InlineKeyboardButton('🧹 Очистить', callback_data=f'clear_logs:{log_type}')],
+                [InlineKeyboardButton('↩️ Назад', callback_data='return:admin_panel')],
+                [InlineKeyboardButton('🏠 Домой', callback_data='return:menu')]
+            ]
+        )    
+
+        try:
+            await context.bot.edit_message_text(
+                text=message,
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=keyboard
+            )
+        except BadRequest:
+            pass
+
+    async def _show_admin_panel(self,
+                               update: Update,
+                               context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        message_id = update.effective_message.id
+        keyboard = ADMIN_PANEL_KEYBOARD
+
+        await context.bot.edit_message_text(
+            text='Панель администратора',
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=keyboard
+        )
+
+    async def _make_user_admin(self,
+                               update: Update,
+                               context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        self._api.make_user_admin(user_id)
+
+        await self._start_menu(update, context)
+
+    async def _init_quiz_creation(self,
+                                  update: Update,
+                                  context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
+        message_id = update.effective_message.id
+        self._api.init_quiz_creation(user_id)
 
         message = ("Ожидается сообщение следующего формата:\n\n"
                     "Название квиза\n"
@@ -57,7 +164,10 @@ class QuizBot:
                     "Каждый из параметров вводится с новой строки.\n\n"
                     "Параметры помещенные в квадратные скобки являются опциональными. Если их не задавать, будут использованы значения по умолчанию:\n"
                     "*для вопросов - \"Вопрос №1\", \"Вопрос №2\"... и так далее по указанному количеству вопросов;\n"
-                    "* для формулировок вариантов ответов - для всех вопрос будут заданые значения от 1 до 4.")
+                    "*для формулировок вариантов ответов - для всех вопрос будут заданые значения от 1 до 4.\n"
+                    "Ввиду ограничений Telegram, не рекомендуется делать варианты ответов длинее 35-40 символов."
+                    "Если формулировка варианта ответа будет слишком длинной, то текст не будет переноситься в пределах кнопки,"
+                    " а будет обрезан многоточием.")
         
         keyboard = InlineKeyboardMarkup(
             [
@@ -72,7 +182,9 @@ class QuizBot:
             reply_markup=keyboard
         )
 
-    async def _return(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _return(self,
+                     update: Update,
+                     context: ContextTypes.DEFAULT_TYPE):
         return_type = update.callback_query.data.split(":")[1]
         message_id = update.effective_message.id
 
@@ -82,36 +194,65 @@ class QuizBot:
             await self._quizzes_menu(update, context)
         elif return_type == 'quizzes_to_manage':
             await self._show_quizzes_to_manage(update, context)
+        elif return_type == 'admin_panel':
+            await self._show_admin_panel(update, context)
 
-    async def _toggle_quiz_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat_id = update.effective_chat.id
+    async def _toggle_quiz_activity(self,
+                                    update: Update,
+                                    context: ContextTypes.DEFAULT_TYPE):
         quiz_id = quiz_id = update.callback_query.data.split(':')[1]
-        self._session.toggle_quiz_status(chat_id, uuid.UUID(quiz_id))
+        self._api.toggle_quiz_activity(quiz_id)
 
         await self._manage_quiz(update, context)
     
-    async def _delete_quiz(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _delete_quiz(self,
+                           update: Update,
+                           context: ContextTypes.DEFAULT_TYPE):
+        quiz_id = quiz_id = update.callback_query.data.split(':')[1]
+        self._api.delete_quiz(quiz_id)
+
+        quizzes = self._api.get_all_quizzes()
+
+        if not quizzes:
+            await self._start_menu(update, context)
+        else:
+            await self._show_quizzes_to_manage(update, context)
+
+    async def _download_quiz_results(self,
+                                     update: Update,
+                                     context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         quiz_id = quiz_id = update.callback_query.data.split(':')[1]
-        self._session.delete_quiz(chat_id, uuid.UUID(quiz_id))
+        results = self._api.get_quiz_results(quiz_id)
 
-        await self._show_quizzes_to_manage(update, context)
+        wb = Workbook()
+        sheet = wb.active
+        sheet['A1'] = 'ФИО'
+        sheet['B1'] = 'Телеграм'
+        sheet['C1'] = 'Результат'
 
-    async def _download_quiz_results(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat_id = update.effective_chat.id
-        quiz_id = quiz_id = update.callback_query.data.split(':')[1]
+        for i, res in enumerate(results):
+            sheet[f'A{i+2}'] = res[0]
+            sheet[f'B{i+2}'] = res[1]
+            sheet[f'C{i+2}'] = res[2]
+        
+        excel_file = BytesIO()
+        wb.save(excel_file)
 
-        quiz_name = str(self._session.get_quiz(uuid.UUID(quiz_id)))
+        quiz_name = str(self._api.fetch_quiz(quiz_id)['name'])
         await context.bot.send_document(
                     chat_id,
-                    document=quiz_name+'.xlsx'
+                    document=excel_file.getvalue(),
+                    filename=f'{quiz_name}.xlsx'
         )
 
-    async def _get_quiz_results(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _get_quiz_results(self,
+                                update: Update,
+                                context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         message_id = update.effective_message.id
         quiz_id = quiz_id = update.callback_query.data.split(':')[1]
-        results = self._session.get_quiz_results(uuid.UUID(quiz_id))
+        results = self._api.get_quiz_results(quiz_id)
 
         if not results:
             await context.bot.answer_callback_query(
@@ -120,47 +261,40 @@ class QuizBot:
                 show_alert=True
             )
         else:
-            results.sort(key=lambda x: int(x[1][0]), reverse=True)
-            message = '\n'.join(f'[{u.real_name}](https://t.me/{u.username}) - {r}' for u,r in results)
+            message = '\n'.join(f'[{x[0]}]({x[1]}) - {x[2]}' for x in results)
+            if message == update.effective_message.text:
+                return
             keyboard = InlineKeyboardMarkup(
                 [
                     [InlineKeyboardButton('⬇️ Скачать xlsx документ', callback_data=f'download:{quiz_id}')],
+                    [InlineKeyboardButton('🔄 Обновить', callback_data=f'results:{quiz_id}')],
                     [InlineKeyboardButton('↩️ Назад', callback_data=f'manage:{quiz_id}'),
                     InlineKeyboardButton('🏠 Домой', callback_data='return:menu')]
                 ]
             )
 
-            wb = Workbook()
-            sheet = wb.active
-            sheet['A1'] = 'ФИО'
-            sheet['B1'] = 'Телеграм'
-            sheet['C1'] = 'Результат'
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=message,
+                    reply_markup=keyboard,
+                    parse_mode='Markdown'
+                )
+            except BadRequest:
+                pass
 
-            for i, (u, r) in enumerate(results):
-                sheet[f'A{i+2}'] = u.real_name
-                sheet[f'B{i+2}'] = f'https://t.me/{u.username}'
-                sheet[f'C{i+2}'] = r
-            
-            quiz_name = str(self._session.get_quiz(uuid.UUID(quiz_id)))
-            wb.save(quiz_name+'.xlsx')
-
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=message,
-                reply_markup=keyboard,
-                parse_mode='Markdown'
-            )
-
-    async def _delete_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _delete_confirmation(self,
+                                  update: Update,
+                                  context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         message_id = update.effective_message.id
-        quiz_id = quiz_id = update.callback_query.data.split(':')[1]
+        quiz_id = update.callback_query.data.split(':')[1]
         
         keyboard = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton('✅', callback_data=f'delete:{quiz_id}')],
-                [InlineKeyboardButton('❌', callback_data=f'manage:{quiz_id}')]
+                [InlineKeyboardButton('✅ Да', callback_data=f'delete:{quiz_id}')],
+                [InlineKeyboardButton('❌ Нет', callback_data=f'manage:{quiz_id}')]
             ]
         )
 
@@ -171,16 +305,19 @@ class QuizBot:
             reply_markup=keyboard
         )
 
-    async def _manage_quiz(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _manage_quiz(self,
+                           update: Update,
+                           context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         message_id = update.effective_message.id
         quiz_id = quiz_id = update.callback_query.data.split(':')[1]
-        quiz_info = self._session.get_quiz(uuid.UUID(quiz_id)).as_dict()
+        quiz_info = self._api.fetch_quiz(quiz_id)
 
         message = f'*Название*: {quiz_info["name"]}\n\n*Вопросы*:\n'
         for i, (x, y) in enumerate(zip(quiz_info['qa_pairs'], quiz_info['right_answers'])):
-            message += f'{i+1}. {x[0]}\nВарианты ответов:\n•'
-            message += '\n•'.join(x[1])
+            question, answers = next(iter((x.items())))
+            message += f'{i+1}. {question}\nВарианты ответов:\n•'
+            message += '\n•'.join(answers)
             message += f'\n(Правильный ответ - {y})\n' 
         message += '\n*Статус*: '
         message += '🟩 (активен)' if quiz_info['is_active'] else '🟥 (неактивен)'
@@ -203,12 +340,14 @@ class QuizBot:
             parse_mode='Markdown'
         )
 
-    async def _show_quizzes_to_manage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _show_quizzes_to_manage(self,
+                                      update: Update,
+                                      context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         message_id = update.effective_message.id
-        quizes = self._session.get_quizzes()
+        quizzes = self._api.get_all_quizzes()
 
-        if not quizes:
+        if not quizzes:
             await context.bot.answer_callback_query(
                 update.callback_query.id,
                 text='Нет созданных квизов',
@@ -217,8 +356,8 @@ class QuizBot:
         else:
             keyboard = InlineKeyboardMarkup(
                     [[InlineKeyboardButton(
-                        str(v), callback_data='manage:'+str(k)
-                    )] for k,v  in quizes.items()
+                        name, callback_data='manage:'+id
+                    )] for id, name, _  in quizzes
                     ] + 
                     [[InlineKeyboardButton('↩️ Назад', callback_data='return:quizzes_menu'),
                      InlineKeyboardButton('🏠 Домой', callback_data='return:menu')]]
@@ -230,14 +369,17 @@ class QuizBot:
                 reply_markup=keyboard
             )
 
-    async def _quizzes_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _quizzes_menu(self,
+                            update: Update,
+                            context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         message_id = update.effective_message.id
-        quizes = self._session.get_quizzes().values()
+        quizzes = self._api.get_all_quizzes()
 
-        if quizes:
+        if quizzes:
             message = 'Доступные квизы:\n-' +\
-                      '\n-'.join(f'{x} ({"🟩" if x.is_active else "🟥"})' for x in quizes)
+                      '\n-'.join(f'{name} ({"🟩" if is_active else "🟥"})' \
+                        for _, name, is_active in quizzes)
         else:
             message = 'Нет созданных квизов'
         
@@ -248,10 +390,12 @@ class QuizBot:
             reply_markup=QUIZZES_MENU_KEYBOARD
         )
 
-    async def _edit_user_real_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _change_user_real_name(self,
+                                     update: Update,
+                                     context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         message_id = update.effective_message.id
-        self._session.set_user_real_name(chat_id, None)
+        self._api.change_user_real_name(chat_id, None)
 
         await context.bot.edit_message_text(
             chat_id=chat_id,
@@ -259,17 +403,20 @@ class QuizBot:
             text='Укажите, пожалуйста, Ваше ФИО'
         )
 
-    async def _create_quiz(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _create_quiz(self,
+                           update: Update,
+                           context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
 
         if update.callback_query is not None:
-            self._session.cancel_quiz_creation(chat_id)
+            self._api.cancel_quiz_creation(chat_id)
             await self._quizzes_menu(update, context)
             return
 
         try:
-            quiz = QuizBuilder.create_quiz_from_message(update.effective_message.text)
-            self._session.add_quiz(chat_id, quiz)
+            quiz_data = QuizBuilder.\
+                        create_quiz_from_message(update.effective_message.text)
+            self._api.add_quiz(quiz_data)
             await context.bot.send_message(
                 chat_id=chat_id,
                 text='Квиз успешно добавлен!'
@@ -281,64 +428,75 @@ class QuizBot:
                 text=f'{err}. Попробуй еще раз.'
             )
         except Exception as exc:
-            print(exc)
+            Logger.log(exc, 'error')
             await context.bot.send_message(
                 chat_id=chat_id,
                 text='Ошибка при создании квиза. Попробуй еще раз.'
             )
 
-    async def _start_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE, message_id: int = None):
+    async def _start_menu(self,
+                          update: Update, 
+                          context: ContextTypes.DEFAULT_TYPE,
+                          message_id: int = None):
         chat_id = update.effective_chat.id
         user_id = update.effective_user.id
         
         if message_id is None:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f'Добро пожаловать,\n{self._session.get_user_real_name(chat_id)}!',
-                reply_markup=USER_KEYBOARD if user_id not in self._admins else ADMIN_KEYBOARD
+                text=f'Добро пожаловать,\n{self._api.get_user_real_name(user_id)}!',
+                reply_markup=ADMIN_START_MENU_KEYBOARD if self._api.is_user_admin(user_id)\
+                                                       else USER_START_MENU_KEYBOARD
             )
         else:
             await context.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id = message_id,
-                text=f'Добро пожаловать,\n{self._session.get_user_real_name(chat_id)}!',
-                reply_markup=USER_KEYBOARD if user_id not in self._admins else ADMIN_KEYBOARD
+                text=f'Добро пожаловать,\n{self._api.get_user_real_name(chat_id)}!',
+                reply_markup=ADMIN_START_MENU_KEYBOARD if self._api.is_user_admin(user_id)\
+                                                       else USER_START_MENU_KEYBOARD
             )
 
-    async def _set_user_real_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _set_user_real_name(self,
+                                  update: Update,
+                                  context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
         message_text = update.effective_message.text.strip().lower()
 
         if not re.match('^([а-я]+ +[а-я]+ +[а-я]+)$', message_text):
             await context.bot.send_message(
                 chat_id=chat_id,
-                text='Неправильный формат ФИО. Необходимо указать данные на кириллице. Попробуй еще раз.'
+                text='Неправильный формат ФИО.'+\
+                     ' Необходимо указать данные на кириллице. Попробуй еще раз.'
             )
         else:
             real_name = ' '.join(x.capitalize() for x in message_text.split() if x)
-            self._session.set_user_real_name(chat_id, real_name)
+            self._api.change_user_real_name(user_id, real_name)
             await self._start_menu(update, context)
 
-    async def _start_user_session(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _authorize_user(self,
+                              update: Update,
+                              context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
-        user_id = update.effective_user.id
 
-        self._session.add_user(
-            chat_id,
+        self._api.add_user(
+            update.effective_user.id,
             update.effective_user.username,
-            update.effective_user.first_name,
-            user_id,
-            user_id in self._admins)
+            update.effective_user.first_name
+        )
 
         await context.bot.send_message(
             chat_id=chat_id,
             text='Укажите, пожалуйста, Ваше ФИО'
         )
     
-    async def _show_quizzes_to_pass(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _show_quizzes_to_pass(self,
+                                    update: Update,
+                                    context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         message_id = update.effective_message.id
-        active_quizzes = {k: v for k,v in self._session.get_quizzes().items() if v.is_active}
+        active_quizzes = list(filter(lambda x: x[2], self._api.get_all_quizzes()))
         if not active_quizzes:
             await context.bot.answer_callback_query(
                 update.callback_query.id,
@@ -348,8 +506,8 @@ class QuizBot:
         else:
             keyboard = InlineKeyboardMarkup(
                 [[InlineKeyboardButton(
-                    str(active_quizzes[x]), callback_data='choose:'+str(x)
-                )] for x in active_quizzes] +
+                    name, callback_data='choose:'+id
+                )] for id, name, _ in active_quizzes] +
                 [[InlineKeyboardButton('↩️ Назад', callback_data='return:menu')]]
             )
 
@@ -360,20 +518,23 @@ class QuizBot:
                 reply_markup=keyboard
             )
 
-    async def _init_user_quiz(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _init_user_quiz(self,
+                              update: Update, 
+                              context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
         message_id = update.effective_message.id
         quiz_id = update.callback_query.data.split(':')[1]
 
-        if self._session.is_user_passed_quiz(chat_id, uuid.UUID(quiz_id)):
+        if self._api.is_user_passed_quiz(user_id, quiz_id):
             await context.bot.answer_callback_query(
                 update.callback_query.id,
                 text='Ты уже проходил этот квиз',
                 show_alert=True
             )
         else:
-            self._session.init_user_quiz(chat_id, uuid.UUID(quiz_id))
-            quiz_info = self._session.get_user_quiz_info(chat_id, uuid.UUID(quiz_id))
+            self._api.init_user_quiz(user_id, quiz_id)
+            quiz_info = self._api.get_user_quiz_info(user_id)
             keyboard = InlineKeyboardMarkup(
                 [[InlineKeyboardButton(
                     x, callback_data=f'quize:{quiz_id}:answer:{i+1}'
@@ -387,23 +548,26 @@ class QuizBot:
                 reply_markup=keyboard
             )
 
-    async def _submit_quiz_answer(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _submit_quiz_answer(self,
+                                  update: Update,
+                                  context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
         message_id = update.effective_message.id
         callback_data = update.callback_query.data.split(':')
         quiz_id = callback_data[1]
         answer = int(callback_data[3])
 
-        self._session.update_user_quiz_data(chat_id, uuid.UUID(quiz_id),answer)
-        quiz_info = self._session.get_user_quiz_info(chat_id, uuid.UUID(quiz_id))
+        self._api.update_user_quiz_data(user_id, answer)
+        quiz_info = self._api.get_user_quiz_info(user_id)
         if quiz_info is None:
             await context.bot.delete_message(chat_id, message_id)
             await context.bot.send_message(
             chat_id=chat_id,
             text='Спасибо за прохождения опроса! Жди результат :)'
             )
-            self._session.apply_user_results(chat_id, uuid.UUID(quiz_id))
-            if update.effective_user.id in self._admins:
+            self._api.submit_user_results(user_id)
+            if self._api.is_user_admin(user_id):
                 await self._start_menu(update, context)
         else:
             keyboard = InlineKeyboardMarkup(
@@ -420,4 +584,6 @@ class QuizBot:
             )
 
     def run(self) -> None:
+        Logger.log('Bot session started', 'info')
         self._app.run_polling()
+        Logger.log('Bot session stoped', 'info')

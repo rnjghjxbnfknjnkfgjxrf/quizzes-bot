@@ -1,47 +1,6 @@
-class Quiz:
-    def __init__(self,
-                 name: str,
-                 qa_pairs: tuple[str,list[str]],
-                 right_answers: list[int]) -> None:
-        self._name = name
-        self._qa_pairs = qa_pairs
-        self._right_answers = right_answers
-        self._is_active = False
-    
-    def check_answers(self, user_answers: list[int]) -> bool:
-        right_answers = 0
-        for user, right in zip(user_answers, self._right_answers):
-            right_answers += int(user==right)
-        return f'{right_answers}/{len(self._right_answers)}'
-
-    def get_questions_number(self) -> int:
-        return len(self._qa_pairs)
-
-    @property
-    def is_active(self) -> bool:
-        return self._is_active
-    
-    def toggle_status(self) -> None:
-        self._is_active = not self._is_active
-    
-    def __str__(self) -> str:
-        return self._name
-    
-    def get_chosen_question(self, question_number: int) -> list:
-        return self._qa_pairs[question_number]
-
-    def as_dict(self) -> dict:
-        return {
-            "name": self._name,
-            "qa_pairs": self._qa_pairs,
-            "right_answers": self._right_answers,
-            "is_active": self.is_active
-        }
-
-
 class QuizBuilder:
     @staticmethod
-    def create_quiz_from_message(message: str) -> Quiz:
+    def create_quiz_from_message(message: str) -> dict:
         message_lines = message.strip().split('\n')
         if len(message_lines) < 3:
             raise QuizCreationError('Неправильные число параметров')
@@ -52,9 +11,9 @@ class QuizBuilder:
             questions_number = int(message_lines[1].strip())
         except ValueError:
             raise QuizCreationError('Количество вопросов должно быть представлено в виде целого числа')
-        right_answers = ()
+        right_answers = []
         try:
-            right_answers = tuple(map(int, message_lines[2].strip().split(' ')))
+            right_answers = list(map(int, message_lines[2].strip().split(' ')))
         except ValueError:
             raise QuizCreationError('Правильные ответы должны быть представлены как целые числа')
         if len(right_answers) != questions_number:
@@ -91,9 +50,13 @@ class QuizBuilder:
         else:
             answers = [['1', '2', '3', '4'] for _ in range(questions_number)]
         
-        qa_pairs = tuple((q, a) for q,a in zip(questions, answers))
+        qa_pairs = [{q:a} for q,a in zip(questions, answers)]
 
-        return Quiz(name, qa_pairs, right_answers)
+        return {
+            'name': name,
+            'qa_pairs': qa_pairs,
+            'right_answers': right_answers
+        }
         
 
 class QuizCreationError(Exception):
