@@ -567,8 +567,7 @@ class QuizBot:
             text='Спасибо за прохождения опроса! Жди результат :)'
             )
             self._api.submit_user_results(user_id)
-            if self._api.is_user_admin(user_id):
-                await self._start_menu(update, context)
+            await self._start_menu(update, context)
         else:
             keyboard = InlineKeyboardMarkup(
                 [[InlineKeyboardButton(
