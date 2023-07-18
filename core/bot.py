@@ -37,7 +37,7 @@ class QuizBot:
             CommandHandler('start', self._authorize_user, start_filter),
             MessageHandler(filters.TEXT & real_name_filter, self._set_user_real_name),
             MessageHandler(admin_filter & filters.TEXT & quiz_creation_filter, self._create_quiz),
-            CallbackQueryHandler(self._create_quiz, pattern='cancel'),
+            CallbackQueryHandler(self._cancel, pattern='cancel:*'),
             CallbackQueryHandler(self._show_quizzes_to_pass, pattern='choose_quiz'),
             CallbackQueryHandler(self._toggle_quiz_activity, pattern='toggle:*'),
             CallbackQueryHandler(self._delete_confirmation, pattern='request_deletion:*'),
@@ -171,7 +171,7 @@ class QuizBot:
         
         keyboard = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton('↩️ Отмена', callback_data='cancel')]
+                [InlineKeyboardButton('❌ Отмена', callback_data='cancel:quiz_creation')]
             ]
         )
 
@@ -181,6 +181,19 @@ class QuizBot:
             message_id=message_id,
             reply_markup=keyboard
         )
+
+    async def _cancel(self,
+                     update: Update,
+                     context: ContextTypes.DEFAULT_TYPE):
+        cancel_type = update.callback_query.data.split(":")[1]
+        user_id = update.effective_user.id
+
+        if cancel_type == 'quiz_creation':
+            self._api.cancel_quiz_creation(user_id)
+            await self._quizzes_menu(update, context)
+        elif cancel_type == 'user_quiz':
+            self._api.cancel_user_quiz(user_id)
+            await self._show_quizzes_to_pass(update, context)
 
     async def _return(self,
                      update: Update,
@@ -196,6 +209,9 @@ class QuizBot:
             await self._show_quizzes_to_manage(update, context)
         elif return_type == 'admin_panel':
             await self._show_admin_panel(update, context)
+        elif return_type == 'quiz':
+            self._api.restore_user_quiz_data(update.effective_user.id)
+            await self._send_quiz_question(update, context)
 
     async def _toggle_quiz_activity(self,
                                     update: Update,
@@ -408,11 +424,6 @@ class QuizBot:
                            context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
 
-        if update.callback_query is not None:
-            self._api.cancel_quiz_creation(chat_id)
-            await self._quizzes_menu(update, context)
-            return
-
         try:
             quiz_data = QuizBuilder.\
                         create_quiz_from_message(update.effective_message.text)
@@ -518,12 +529,36 @@ class QuizBot:
                 reply_markup=keyboard
             )
 
-    async def _init_user_quiz(self,
+    async def _send_quiz_question(self,
                               update: Update, 
                               context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         user_id = update.effective_user.id
         message_id = update.effective_message.id
+        quiz_id = update.callback_query.data.split(':')[1]
+
+        quiz_info, question_number = self._api.get_user_quiz_info(user_id)
+        button = InlineKeyboardButton('❌ Отмена', callback_data='cancel:user_quiz')\
+                if question_number == 1 else\
+                InlineKeyboardButton('↩️ Назад', callback_data='return:quiz')
+        keyboard = InlineKeyboardMarkup(
+                [[InlineKeyboardButton(
+                    x, callback_data=f'quize:{quiz_id}:answer:{i+1}'
+                )]  for i, x in enumerate(quiz_info[1])] +\
+                [[button]]
+        )
+
+        await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=quiz_info[0],
+                reply_markup=keyboard
+        )
+
+    async def _init_user_quiz(self,
+                              update: Update, 
+                              context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
         quiz_id = update.callback_query.data.split(':')[1]
 
         if self._api.is_user_passed_quiz(user_id, quiz_id):
@@ -534,19 +569,7 @@ class QuizBot:
             )
         else:
             self._api.init_user_quiz(user_id, quiz_id)
-            quiz_info = self._api.get_user_quiz_info(user_id)
-            keyboard = InlineKeyboardMarkup(
-                [[InlineKeyboardButton(
-                    x, callback_data=f'quize:{quiz_id}:answer:{i+1}'
-                )]  for i, x in enumerate(quiz_info[1])]
-            )
-
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=quiz_info[0],
-                reply_markup=keyboard
-            )
+            await self._send_quiz_question(update, context)
 
     async def _submit_quiz_answer(self,
                                   update: Update,
@@ -555,7 +578,6 @@ class QuizBot:
         user_id = update.effective_user.id
         message_id = update.effective_message.id
         callback_data = update.callback_query.data.split(':')
-        quiz_id = callback_data[1]
         answer = int(callback_data[3])
 
         self._api.update_user_quiz_data(user_id, answer)
@@ -569,18 +591,8 @@ class QuizBot:
             self._api.submit_user_results(user_id)
             await self._start_menu(update, context)
         else:
-            keyboard = InlineKeyboardMarkup(
-                [[InlineKeyboardButton(
-                    x, callback_data=f'quize:{quiz_id}:answer:{i+1}'
-                )]  for i, x in enumerate(quiz_info[1])]
-            )
+            await self._send_quiz_question(update, context)
 
-            await context.bot.edit_message_text(
-                    quiz_info[0],
-                    chat_id,
-                    message_id,
-                    reply_markup=keyboard
-            )
 
     def run(self) -> None:
         Logger.log('Bot session started', 'info')

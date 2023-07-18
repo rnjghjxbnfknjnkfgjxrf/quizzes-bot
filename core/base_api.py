@@ -52,21 +52,31 @@ class API:
         self._user_to_quiz[user_id]=  [0, [], None, self._db.fetch_quiz(quiz_id)]
         Logger.log(f'Started quiz: {user_id} ~ {quiz_id}', 'info')
 
+    def cancel_user_quiz(self, user_id: int) -> None:
+        self._user_to_quiz.pop(user_id)
+        Logger.log(f'Cancelled quiz: {user_id}', 'info')
+
     def submit_user_results(self, user_id: int) -> None:
         user_quiz_data = self._user_to_quiz[user_id]
         self._db.submit_user_result(user_id, user_quiz_data[3]['quiz_id'], user_quiz_data[1])
         Logger.log(f'Submitted result: {user_id}', 'info')
 
+    def restore_user_quiz_data(self, user_id: int) -> None:
+        self._user_to_quiz[user_id][0] -= 1
+        self._user_to_quiz[user_id][1].pop()
+
     def update_user_quiz_data(self, user_id: int, answer: int) -> None:
         self._user_to_quiz[user_id][0] += 1
         self._user_to_quiz[user_id][1].append(answer)
     
-    def get_user_quiz_info(self, user_id: int):
+    def get_user_quiz_info(self, user_id: int) -> tuple | None:
         user_quiz_data = self._user_to_quiz[user_id]
         quiz_data = user_quiz_data[3]
 
-        return next(iter(quiz_data['qa_pairs'][user_quiz_data[0]].items())) if not\
-            len(user_quiz_data[1]) == len(quiz_data['right_answers']) else None
+        if user_quiz_data[0] == len(quiz_data['right_answers']):
+            return None
+        else:
+            return next(iter(quiz_data['qa_pairs'][user_quiz_data[0]].items())), user_quiz_data[0] + 1
 
     def change_user_real_name(self, user_id: int, real_name: str | None) -> None:
         self._db.change_user_real_name(user_id, real_name)
